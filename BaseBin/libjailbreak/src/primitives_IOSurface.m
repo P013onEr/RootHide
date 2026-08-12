@@ -84,7 +84,7 @@ uint32_t IOMemoryDescriptor_get_flags(uint64_t memoryDescriptor)
 
 void IOMemoryDescriptor_set_flags(uint64_t memoryDescriptor, uint32_t flags)
 {
-	kwrite32(memoryDescriptor + 0x20, flags);
+	kwrite8(memoryDescriptor + 0x20, flags);
 }
 
 void IOMemoryDescriptor_set_memRef(uint64_t memoryDescriptor, uint64_t memRef)
@@ -139,47 +139,10 @@ static mach_port_t IOSurface_map_getSurfacePort(uint64_t magic, uint32_t cacheMo
 	return port;
 }
 
-static int IOSurface_map_allocateKernelRanges(uint64_t *rangesOut, mach_port_t *portOut)
-{
-	static vm_address_t dummyPage;
-	if (!dummyPage && vm_allocate(mach_task_self(), &dummyPage, 0x4000, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
-		return -1;
-	}
-
-	uint64_t userspaceRanges[4] = {
-		dummyPage, 0x4000,
-		dummyPage, 0x4000,
-	};
-	NSData *addressRanges = [NSData dataWithBytes:userspaceRanges length:sizeof(userspaceRanges)];
-	IOSurfaceRef surfaceRef = IOSurfaceCreate((__bridge CFDictionaryRef)@{
-		@"IOSurfaceAllocSize" : @0x4000,
-		@"IOSurfaceAddressRanges" : addressRanges,
-	});
-	if (!surfaceRef) return -1;
-
-	mach_port_t port = IOSurfaceCreateMachPort(surfaceRef);
-	IOSurfaceDecrementUseCount(surfaceRef);
-	CFRelease(surfaceRef);
-	if (!MACH_PORT_VALID(port)) return -1;
-
-	uint64_t surfaceSendRight = IOSurface_port_getSendRight(port);
-	uint64_t surface = IOSurfaceSendRight_get_surface(surfaceSendRight);
-	uint64_t ranges = IOSurface_get_ranges(surface);
-	if (!ranges) {
-		mach_port_deallocate(mach_task_self(), port);
-		return -1;
-	}
-
-	*rangesOut = ranges;
-	*portOut = port;
-	return 0;
-}
-
 struct IOSurfaceMapCleanup {
 	uint64_t descriptor;
 	uint64_t originalRanges;
 	uint64_t *fakeRanges;
-	mach_port_t kernelRangesPort;
 };
 
 static struct IOSurfaceMapCleanup *gMapCleanups;
@@ -188,44 +151,31 @@ static unsigned gMapCleanupCount;
 int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32_t cacheMode)
 {
 	mach_port_t surfaceMachPort = IOSurface_map_getSurfacePort(1337, cacheMode);
+	if (!MACH_PORT_VALID(surfaceMachPort)) return -1;
 
 	uint64_t surfaceSendRight = IOSurface_port_getSendRight(surfaceMachPort);
 	uint64_t surface = IOSurfaceSendRight_get_surface(surfaceSendRight);
 	uint64_t desc = IOSurface_get_memoryDescriptor(surface);
 	uint64_t ranges = IOMemoryDescriptor_get_ranges(desc);
+	if (!surface || !desc || !ranges) {
+		mach_port_deallocate(mach_task_self(), surfaceMachPort);
+		return -1;
+	}
 
 	if (gPrimitives.krwMinSafeReadSize > 0x10) {
-		uint64_t *fakeRanges = NULL;
-		uint64_t fakeRangesKaddr = 0;
-		mach_port_t kernelRangesPort = MACH_PORT_NULL;
-
-		if (@available(iOS 17.0, *)) {
-			if (IOSurface_map_allocateKernelRanges(&fakeRangesKaddr, &kernelRangesPort) != 0) {
-				mach_port_deallocate(mach_task_self(), surfaceMachPort);
-				return -1;
-			}
-			uint64_t replacementRanges[4] = { pa, size, 0, 0 };
-			if (kwritebuf(fakeRangesKaddr, replacementRanges, sizeof(replacementRanges)) != 0) {
-				mach_port_deallocate(mach_task_self(), kernelRangesPort);
-				mach_port_deallocate(mach_task_self(), surfaceMachPort);
-				return -1;
-			}
+		uint64_t *fakeRanges = malloc(2 * sizeof(uint64_t));
+		if (!fakeRanges) {
+			mach_port_deallocate(mach_task_self(), surfaceMachPort);
+			return -1;
 		}
-		else {
-			fakeRanges = malloc(2 * sizeof(uint64_t));
-			if (!fakeRanges) {
-				mach_port_deallocate(mach_task_self(), surfaceMachPort);
-				return -1;
-			}
-			fakeRanges[0] = pa;
-			fakeRanges[1] = size;
-			fakeRangesKaddr = phystokv(vtophys(ttep_self(), (uint64_t)fakeRanges));
-		}
+		fakeRanges[0] = pa;
+		fakeRanges[1] = size;
 
+		uint64_t fakeRangesKaddr = phystokv(vtophys(ttep_self(), (uint64_t)fakeRanges));
 		IOMemoryDescriptor_set_ranges(desc, fakeRangesKaddr);
 
 		gMapCleanups = realloc(gMapCleanups, ++gMapCleanupCount * sizeof(*gMapCleanups));
-		gMapCleanups[gMapCleanupCount - 1] = (struct IOSurfaceMapCleanup){ desc, ranges, fakeRanges, kernelRangesPort };
+		gMapCleanups[gMapCleanupCount - 1] = (struct IOSurfaceMapCleanup){ desc, ranges, fakeRanges };
 	}
 	else {
 		kwrite64(ranges, pa);
@@ -256,6 +206,14 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		return -1;
 	}
 
+	if (@available(iOS 17.0, *)) {
+	}
+	else {
+		vm_prot_t cur_prot, max_prot;
+		kern_return_t kr = vm_remap(mach_task_self(), (vm_address_t *)uaddr, size, 0, VM_FLAGS_ANYWHERE, mach_task_self(), (vm_address_t)*uaddr, FALSE, &cur_prot, &max_prot, VM_INHERIT_NONE);
+		assert(kr == KERN_SUCCESS);
+	}
+
 	return 0;
 }
 
@@ -269,9 +227,6 @@ void IOSurface_map_cleanup(void)
 	for (unsigned i = 0; i < gMapCleanupCount; i++) {
 		IOMemoryDescriptor_set_ranges(gMapCleanups[i].descriptor, gMapCleanups[i].originalRanges);
 		free(gMapCleanups[i].fakeRanges);
-		if (MACH_PORT_VALID(gMapCleanups[i].kernelRangesPort)) {
-			mach_port_deallocate(mach_task_self(), gMapCleanups[i].kernelRangesPort);
-		}
 	}
 	free(gMapCleanups);
 	gMapCleanups = NULL;
