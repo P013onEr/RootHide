@@ -43,8 +43,8 @@ __attribute__((constructor)) static void initializer(void)
 {
 /////////////////////////////
 if(access("/var/log/.disable_watchdoghook", F_OK) == 0) {
-	return;
-}
+		return;
+	}
 ///////////////////////////////
 
 	MSHookFunction(IOServiceOpen, (void *)&IOServiceOpen_hook, (void **)&IOServiceOpen_orig);

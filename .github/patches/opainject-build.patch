@@ -108,13 +108,17 @@ diff --git a/rop_inject.m b/rop_inject.m
 index 77acb84..f125a72 100644
 --- a/rop_inject.m
 +++ b/rop_inject.m
-@@ -293,12 +293,22 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut,
+@@ -293,13 +293,22 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut,
  	thread_act_array_t cachedThreads;
  	mach_msg_type_number_t cachedThreadCount;
  	kr = task_threads(task, &cachedThreads, &cachedThreadCount);
 -	if (kr != KERN_SUCCESS) return kr;
 +	if (kr != KERN_SUCCESS) {
-+		free(origThreadFullState);
++		// The target thread was already rewritten for the remote call.
++		// Restore it before returning or launchd may continue with a bad PC/SP.
++		thread_abort(targetThread);
++		thread_restore_state_arm64(targetThread, origThreadFullState);
++		origThreadFullState = NULL; // thread_restore_state_arm64 consumes it
 +		vm_deallocate(task, remoteStack, STACK_SIZE);
 +		thread_resume(targetThread);
 +		return kr;
@@ -132,15 +136,19 @@ index 77acb84..f125a72 100644
  	printf("[arbCall] Started thread, waiting for it to finish...\n");
  
  	// wait for arbitary call to finish (or not)
-@@ -310,6 +320,11 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut,
+@@ -310,7 +320,15 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut,
+ 		if(kr != KERN_SUCCESS)
  		{
- 			free(origThreadFullState);
- 			printf("[arbCall] ERROR: failed to wait for thread to finish: %s\n", mach_error_string(kr));
-+			if (kr == KERN_OPERATION_TIMED_OUT) {
-+				printf("[arbCall] Remote call still active; preserving its stack and thread state\n");
-+				return kr;
-+			}
+-			free(origThreadFullState);
++			// The target was resumed before waiting. Fail closed: abort the
++			// remote call, restore the original context, then release its stack.
++			thread_suspend(targetThread);
++			thread_abort(targetThread);
++			thread_restore_state_arm64(targetThread, origThreadFullState);
++			origThreadFullState = NULL; // thread_restore_state_arm64 consumes it
 +			vm_deallocate(task, remoteStack, STACK_SIZE);
++			thread_resume(targetThread);
+ 			printf("[arbCall] ERROR: failed to wait for thread to finish: %s\n", mach_error_string(kr));
  			return kr;
  		}
  
@@ -187,8 +195,11 @@ index 77acb84..f125a72 100644
 -			arbCall(task, pthread, (uint64_t*)&readExtensionRet, true, sandbox_extension_consumeAddr, 1, remoteExtString);
 -			vm_deallocate(task, remoteExtString, remoteExtStringSize);
 +			kern_return_t kr = arbCall(task, pthread, (uint64_t*)&readExtensionRet, true, sandbox_extension_consumeAddr, 1, remoteExtString);
-+			if (kr != KERN_OPERATION_TIMED_OUT) vm_deallocate(task, remoteExtString, remoteExtStringSize);
-+			if (kr != KERN_SUCCESS) return kr;
++			vm_deallocate(task, remoteExtString, remoteExtStringSize);
++			if (kr != KERN_SUCCESS) {
++				thread_terminate(pthread);
++				return kr;
++			}
  
  			printf("[sandboxFixup] sandbox_extension_consume returned %lld for read extension\n", (int64_t)readExtensionRet);
 -			retval |= (readExtensionRet <= 0);
@@ -212,8 +223,11 @@ index 77acb84..f125a72 100644
 -			arbCall(task, pthread, (uint64_t*)&executableExtensionRet, true, sandbox_extension_consumeAddr, 1, remoteExtString);
 -			vm_deallocate(task, remoteExtString, remoteExtStringSize);
 +			kern_return_t kr = arbCall(task, pthread, (uint64_t*)&executableExtensionRet, true, sandbox_extension_consumeAddr, 1, remoteExtString);
-+			if (kr != KERN_OPERATION_TIMED_OUT) vm_deallocate(task, remoteExtString, remoteExtStringSize);
-+			if (kr != KERN_SUCCESS) return kr;
++			vm_deallocate(task, remoteExtString, remoteExtStringSize);
++			if (kr != KERN_SUCCESS) {
++				thread_terminate(pthread);
++				return kr;
++			}
  
  			printf("[sandboxFixup] sandbox_extension_consume returned %lld for executable extension\n", (int64_t)executableExtensionRet);
 -			retval |= (executableExtensionRet <= 0);
@@ -243,7 +257,7 @@ index 77acb84..f125a72 100644
 +	kr = sandboxFixup(task, pthread, pid, dylibPath, allImageInfoAddr);
 +	if (kr != KERN_SUCCESS) {
 +		printf("[injectDylibViaRop] ERROR: sandbox fixup failed: %s\n", mach_error_string(kr));
-+		if (kr != KERN_OPERATION_TIMED_OUT) thread_terminate(pthread);
++		thread_terminate(pthread);
 +		return kr;
 +	}
  
@@ -268,8 +282,11 @@ index 77acb84..f125a72 100644
 -		vm_deallocate(task, remoteDylibPath, remoteDylibPathSize);
 +		void* dlopenRet = NULL;
 +		kr = arbCall(task, pthread, (uint64_t*)&dlopenRet, true, dlopenAddr, 2, remoteDylibPath, RTLD_NOW);
-+		if (kr != KERN_OPERATION_TIMED_OUT) vm_deallocate(task, remoteDylibPath, remoteDylibPathSize);
-+		if (kr != KERN_SUCCESS) return kr;
++		vm_deallocate(task, remoteDylibPath, remoteDylibPathSize);
++		if (kr != KERN_SUCCESS) {
++			thread_terminate(pthread);
++			return kr;
++		}
  
  		if (dlopenRet) {
  			printf("[injectDylibViaRop] dlopen succeeded, library handle: %p\n", dlopenRet);
@@ -278,7 +295,10 @@ index 77acb84..f125a72 100644
  			uint64_t remoteErrorString = 0;
 -			arbCall(task, pthread, (uint64_t*)&remoteErrorString, true, dlerrorAddr, 0);
 +			kr = arbCall(task, pthread, (uint64_t*)&remoteErrorString, true, dlerrorAddr, 0);
-+			if (kr != KERN_SUCCESS) return kr;
++			if (kr != KERN_SUCCESS) {
++				thread_terminate(pthread);
++				return kr;
++			}
  			char *errorString = task_copy_string(task, remoteErrorString);
  			printf("[injectDylibViaRop] dlopen failed, error:\n%s\n", errorString);
  			free(errorString);

@@ -1,0 +1,12 @@
+diff --git a/rop_inject.m b/rop_inject.m
+index f125a72..d7c0b1a 100644
+--- a/rop_inject.m
++++ b/rop_inject.m
+@@ -349,3 +349,0 @@
+-	// release fake stack as it's no longer needed
+-	vm_deallocate(task, remoteStack, STACK_SIZE);
+-
+@@ -369,0 +367,3 @@
++	// Keep the temporary stack mapped until the target has been restored.
++	vm_deallocate(task, remoteStack, STACK_SIZE);
++
