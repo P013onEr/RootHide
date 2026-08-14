@@ -42,9 +42,11 @@ kern_return_t IOConnectCallStructMethod_hook(mach_port_t connection, uint32_t se
 __attribute__((constructor)) static void initializer(void)
 {
 /////////////////////////////
-if(access("/var/log/.disable_watchdoghook", F_OK) == 0) {
-	return;
-}
+if (1) {
+        // DEBUG A/B: disable RootHide watchdoghook installation.
+        // Leave the stock iOS watchdog behavior untouched.
+        return;
+    }
 ///////////////////////////////
 
 	MSHookFunction(IOServiceOpen, (void *)&IOServiceOpen_hook, (void **)&IOServiceOpen_orig);

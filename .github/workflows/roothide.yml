@@ -44,7 +44,8 @@ jobs:
         run: |
           set -euo pipefail
           git -C BaseBin/XPF apply "$GITHUB_WORKSPACE/.github/patches/XPF-roothide.patch"
-          git -C BaseBin/opainject apply "$GITHUB_WORKSPACE/.github/patches/opainject-build.patch"
+          git -C BaseBin/opainject apply --recount "$GITHUB_WORKSPACE/.github/patches/opainject-build.patch"
+          git -C BaseBin/opainject apply "$GITHUB_WORKSPACE/.github/patches/opainject-serial-cleanup.patch"
 
       # Xcode 15.4 is the last toolchain used by the original Dopamine 3
       # project layout. Newer Xcodes treat some command-line targets as

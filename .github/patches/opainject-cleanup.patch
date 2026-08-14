@@ -1,0 +1,25 @@
+diff --git a/rop_inject.m b/rop_inject.m
+--- a/rop_inject.m
++++ b/rop_inject.m
+@@
+ 	kr = task_threads(task, &cachedThreads, &cachedThreadCount);
+ 	if (kr != KERN_SUCCESS) {
++		// The target thread was already rewritten for the remote call.
++		// Restore it before returning or launchd may continue with a bad PC/SP.
++		thread_abort(targetThread);
++		thread_restore_state_arm64(targetThread, origThreadFullState);
+ 		free(origThreadFullState);
+ 		vm_deallocate(task, remoteStack, STACK_SIZE);
+ 		thread_resume(targetThread);
+@@
+ 		if(kr != KERN_SUCCESS)
+ 		{
++			if (kr != KERN_OPERATION_TIMED_OUT) {
++				// All non-timeout errors must restore the hijacked target thread.
++				thread_suspend(targetThread);
++				thread_abort(targetThread);
++				thread_restore_state_arm64(targetThread, origThreadFullState);
++				thread_resume(targetThread);
++			}
+ 			free(origThreadFullState);
+ 			printf("[arbCall] ERROR: failed to wait for thread to finish: %s\n", mach_error_string(kr));

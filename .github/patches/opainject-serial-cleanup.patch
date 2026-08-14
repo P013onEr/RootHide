@@ -1,0 +1,91 @@
+diff --git a/rop_inject.m b/rop_inject.m
+index 956e7b9..b7c7a03 100644
+--- a/rop_inject.m
++++ b/rop_inject.m
+@@ -308,11 +308,6 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut,
+ 
+ 	// perform arbitary call
+ 	thread_resume(targetThread);
+-	// Constructors and runtime availability checks can need work from another
+-	// target-process thread. Keeping all launchd threads suspended here can
+-	// deadlock dlopen until the system watchdog panics.
+-	resume_threads_except_for(cachedThreads, cachedThreadCount, targetThread);
+-	vm_deallocate(mach_task_self(), (vm_offset_t)cachedThreads, sizeof(thread_act_array_t) * cachedThreadCount);
+ 	printf("[arbCall] Started thread, waiting for it to finish...\n");
+ 
+ 	// wait for arbitary call to finish (or not)
+@@ -328,6 +323,8 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut,
+ 			thread_abort(targetThread);
+ 			thread_restore_state_arm64(targetThread, origThreadFullState);
+ 			origThreadFullState = NULL; // thread_restore_state_arm64 consumes it
++			resume_threads_except_for(cachedThreads, cachedThreadCount, targetThread);
++			vm_deallocate(mach_task_self(), (vm_offset_t)cachedThreads, sizeof(thread_act_array_t) * cachedThreadCount);
+ 			vm_deallocate(task, remoteStack, STACK_SIZE);
+ 			thread_resume(targetThread);
+ 			printf("[arbCall] ERROR: failed to wait for thread to finish: %s\n", mach_error_string(kr));
+@@ -344,11 +341,10 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut,
+ 	{
+ 		kr = wait_for_thread(targetThread, 0, &outState);
+ 		printf("[arbCall] pthread successfully did not return with code %d (%s)\n", kr, mach_error_string(kr));
++		free(origThreadFullState);
++		origThreadFullState = NULL;
+ 	}
+ 
+-	// release fake stack as it's no longer needed
+-	vm_deallocate(task, remoteStack, STACK_SIZE);
+-
+ 	if (willReturn)
+ 	{
+ 		// suspend target thread
+@@ -360,6 +356,8 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut,
+ 		if(!restoreSuccess)
+ 		{
+ 			printf("[arbCall] ERROR: failed to revert to old thread state\n");
++			resume_threads_except_for(cachedThreads, cachedThreadCount, targetThread);
++			vm_deallocate(mach_task_self(), (vm_offset_t)cachedThreads, sizeof(thread_act_array_t) * cachedThreadCount);
+ 			return kr;
+ 		}
+ 
+@@ -368,6 +366,11 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut,
+ 		thread_resume(targetThread);
+ 	}
+ 
++	// Balance all suspend counts before releasing the thread array.
++	resume_threads_except_for(cachedThreads, cachedThreadCount, targetThread);
++	vm_deallocate(mach_task_self(), (vm_offset_t)cachedThreads, sizeof(thread_act_array_t) * cachedThreadCount);
++	// Release the temporary stack only after the target has been restored.
++	vm_deallocate(task, remoteStack, STACK_SIZE);
+ 	return kr;
+ }
+ 
+@@ -511,6 +514,15 @@ kern_return_t injectDylibViaRop(task_t task, pid_t pid, const char* dylibPath, v
+ 		return KERN_FAILURE;
+ 	}
+ 
+-	thread_terminate(pthread);
++	// Exit through pthread_exit so libsystem can run pthread teardown.
++	// Direct Mach thread termination can leave launchd's pthread bookkeeping
++	// inconsistent and cause initproc to exit.
++	vm_address_t libSystemPthreadAddr = getRemoteImageAddress(task, allImageInfoAddr, "/usr/lib/system/libsystem_pthread.dylib");
++	uint64_t pthreadExitAddr = remoteDlSym(task, libSystemPthreadAddr, "_pthread_exit");
++	if (pthreadExitAddr) {
++		(void)arbCall(task, pthread, NULL, false, pthreadExitAddr, 1, (uint64_t)NULL);
++	} else {
++		thread_terminate(pthread);
++	}
+ 	return KERN_SUCCESS;
+ }
+diff --git a/thread_utils.m b/thread_utils.m
+index 58784c6..a004204 100644
+--- a/thread_utils.m
++++ b/thread_utils.m
+@@ -108,7 +108,8 @@ kern_return_t wait_for_thread(thread_act_t thread, uint64_t pcToWait, struct arm
+ 		kern_return_t kr = thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&stateToObserve.ts_64, &stateToObserveCount);
+ 		if(kr != KERN_SUCCESS)
+ 		{
+-			if (pcToWait == 0) return kr;
++			// A non-returning call is expected to terminate its remote thread.
++			if (pcToWait == 0) return KERN_SUCCESS;
+ 
+ 			errCount++;
+ 			if(errCount >= 5)

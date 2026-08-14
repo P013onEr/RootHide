@@ -141,6 +141,10 @@ __attribute__((constructor)) static void initializer(void)
 		return;
 	}
 
+	// DEBUG A/B: preserve primitive recovery and boomerang handoff, but
+	// skip all launchd hook registration and post-initialization logic.
+	return;
+
 	if (jbupdatePrevVersion && jbupdateNewVersion) {
 		jbupdate_finalize_stage2(jbupdatePrevVersion, jbupdateNewVersion);
 		unsetenv("JBUPDATE_PREV_VERSION");
@@ -190,3 +194,4 @@ __attribute__((constructor)) static void initializer(void)
 roothide_launchd_postinit(firstLoad);
 /********** roothide specfic ********/
 }
+
